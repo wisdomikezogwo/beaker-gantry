@@ -2,10 +2,18 @@
 
 set -eo pipefail
 
+# Debug flags for better diagnostics
+echo "[GANTRY] Starting with environment variables:"
+echo "NO_CONDA: ${NO_CONDA}"
+echo "NO_PYTHON: ${NO_PYTHON}"
+echo "GITHUB_REPO: ${GITHUB_REPO}"
+echo "GIT_REF: ${GIT_REF}"
+echo "GITHUB_TOKEN: ${GITHUB_TOKEN:+<redacted>}"
+
 # Ensure we have all the environment variables we need.
-for env_var in "$GITHUB_REPO" "$GIT_REF"; do
-    if [[ -z "$env_var" ]]; then
-        echo >&2 "error: required environment variable is empty"
+for env_var in GITHUB_REPO GIT_REF; do
+    if [[ -z "${!env_var}" ]]; then
+        echo >&2 "error: required environment variable ${env_var} is empty"
         exit 1
     fi
 done
@@ -13,6 +21,12 @@ done
 # Function to check for conda, install it if needed.
 function ensure_conda {
     if ! command -v conda &> /dev/null; then
+        # Skip if NO_CONDA is set
+        if [[ -n "$NO_CONDA" ]]; then
+            echo "[GANTRY] Skipping conda installation as NO_CONDA is set"
+            return 0
+        fi
+        
         echo "[GANTRY] Installing conda..."
         curl -fsSL -o ~/miniconda.sh -O  https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
         chmod +x ~/miniconda.sh
@@ -21,11 +35,31 @@ function ensure_conda {
         export PATH="/opt/conda/bin:$PATH"
     fi
 
-    # Initialize conda for bash.
-    # See https://stackoverflow.com/a/58081608/4151392
-    eval "$(command conda 'shell.bash' 'hook' 2> /dev/null)"
+    # Initialize conda for bash only if we're using conda
+    if [[ -z "$NO_CONDA" ]]; then
+        # See https://stackoverflow.com/a/58081608/4151392
+        eval "$(command conda 'shell.bash' 'hook' 2> /dev/null)"
+    fi
 }
 
+# Setup git authentication with token
+function setup_git_auth {
+    if [[ -n "$GITHUB_TOKEN" ]]; then
+        echo "[GANTRY] Setting up git authentication using GitHub token"
+        # Configure git to use the token for authentication
+        git config --global credential.helper store
+        echo "https://oauth2:${GITHUB_TOKEN}@github.com" > ~/.git-credentials
+        # Set basic git config if not present
+        git config --global --get user.name >/dev/null || git config --global user.name "wisdomikezogwo"
+        git config --global --get user.email >/dev/null || git config --global user.email "wisdomikezogwo@gmail.com"
+        return 0
+    else
+        echo "[GANTRY] No GitHub token provided for authentication"
+        return 1
+    fi
+}
+
+# Install GitHub CLI if needed and not skipping conda
 if [[ -n "$GITHUB_TOKEN" ]]; then
     echo "
 ########################################
@@ -33,18 +67,28 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
 ########################################
 "
     if ! command -v gh &> /dev/null; then
-        if [[ -z "$NO_CONDA" ]]; then
-            ensure_conda
+        if [[ -n "$NO_CONDA" ]]; then
+            echo "[GANTRY] NO_CONDA is set, skipping GitHub CLI installation"
+            setup_git_auth
         else
-            echo >&2 "error: you specified '--no-conda' but conda is needed to install the GitHub CLI. To avoid this error please ensure the GitHub CLI is already installed on your image."
+            ensure_conda
+            # Install GitHub CLI
+            conda install -y gh --channel conda-forge
+            
+            # Configure git to use GitHub CLI as a credential helper
+            if command -v gh &> /dev/null; then
+                gh auth setup-git
+            else
+                setup_git_auth
+            fi
         fi
-
-        # Install GitHub CLI.
-        conda install -y gh --channel conda-forge
+    else
+        # GitHub CLI is already installed
+        gh auth setup-git
     fi
-    
-    # Configure git to use GitHub CLI as a credential helper so that we can clone private repos.
-    gh auth setup-git
+else
+    # No GitHub token, try to proceed with public repo
+    echo "[GANTRY] No GitHub token provided, assuming public repository"
 fi
 
 echo "
@@ -62,11 +106,21 @@ cd "${{ RUNTIME_DIR }}"
 attempts=1
 until [ "$attempts" -eq 5 ]
 do
-    if [[ -n "$GITHUB_TOKEN" ]]; then
+    # Try cloning with GitHub CLI if available
+    if [[ -n "$GITHUB_TOKEN" ]] && command -v gh &> /dev/null; then
+        echo "[GANTRY] Cloning repository using GitHub CLI"
         gh repo clone "$GITHUB_REPO" . && break
+    # Otherwise try direct git clone with credentials already set up
+    elif [[ -n "$GITHUB_TOKEN" ]]; then
+        echo "[GANTRY] Cloning repository using git with token authentication"
+        git clone "https://github.com/$GITHUB_REPO" . && break
+    # Last resort - public repo without auth
     else
+        echo "[GANTRY] Attempting to clone public repository"
         git clone "https://github.com/$GITHUB_REPO" . && break
     fi
+    
+    echo "[GANTRY] Clone attempt $attempts failed, retrying..."
     attempts=$((attempts+1)) 
     sleep 10
 done
@@ -76,9 +130,13 @@ if [ $attempts -eq 5 ]; then
   exit 1
 fi
 
+echo "[GANTRY] Checking out ref: $GIT_REF"
 git checkout "$GIT_REF"
+
+echo "[GANTRY] Updating git submodules"
 git submodule update --init --recursive
 
+# Skip Python environment setup if NO_PYTHON is set
 if [[ -z "$NO_PYTHON" ]]; then
     echo "
 ###################################
@@ -133,6 +191,8 @@ if [[ -z "$NO_PYTHON" ]]; then
             fi
             conda activate "$VENV_NAME"
         fi
+    else
+        echo "[GANTRY] Skipping conda environment setup as NO_CONDA is set"
     fi
     
     if [[ -z "$INSTALL_CMD" ]]; then
@@ -177,6 +237,12 @@ if [[ -z "$NO_PYTHON" ]]; then
     else
         pip freeze
     fi
+else
+    echo "[GANTRY] Skipping Python environment setup as NO_PYTHON is set"
+    
+    # Still create results directory even if skipping Python setup
+    # shellcheck disable=SC2296
+    mkdir -p "${{ RESULTS_DIR }}/.gantry"
 fi
 
 echo "

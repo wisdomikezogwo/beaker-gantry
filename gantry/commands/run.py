@@ -698,6 +698,8 @@ def build_experiment_spec(
 
     if no_python:
         task_spec = task_spec.with_env_var(name="NO_PYTHON", value="1")
+        if no_conda:
+            task_spec = task_spec.with_env_var(name="NO_CONDA", value="1")
     else:
         if not no_conda:
             if conda is not None:
